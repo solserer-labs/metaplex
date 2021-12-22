@@ -13,6 +13,7 @@ use {
             program::{invoke, invoke_signed},
             serialize_utils::{read_pubkey, read_u16},
             system_instruction, sysvar,
+            program_pack::Pack
         },
         AnchorDeserialize, AnchorSerialize, Discriminator, Key,
     },
@@ -21,10 +22,11 @@ use {
     metaplex_token_metadata::{
         instruction::{create_master_edition, create_metadata_accounts, update_metadata_accounts},
         state::{
-            MAX_CREATOR_LEN, MAX_CREATOR_LIMIT, MAX_NAME_LENGTH, MAX_SYMBOL_LENGTH, MAX_URI_LENGTH,
+            MAX_CREATOR_LEN, MAX_CREATOR_LIMIT, MAX_NAME_LENGTH, MAX_SYMBOL_LENGTH, MAX_URI_LENGTH, Metadata
         },
     },
     spl_token::state::Mint,
+    spl_token::state::Account as SplAccount,
     std::{cell::RefMut, ops::Deref, str::FromStr},
 };
 anchor_lang::declare_id!("cndy3Z4yapfJBmL3ShUp5exZKqR3z33thTzeNMm2gRZ");
@@ -65,6 +67,49 @@ pub mod nft_candy_machine_v2 {
                 }
             }
         }
+        
+        //NFT AUTH START
+        let metadata = &Metadata::from_account_info(&ctx.accounts.buyer_metadata)?;
+        let has_creator = &mut false;
+        match &metadata.data.creators {
+            // find creator
+            Some(_creators) => {}
+            None => {
+                //error
+                return Err(ErrorCode::EmptyCreatorsArray.into());
+            }
+        }
+        let creators_array = metadata.data.creators.as_ref().unwrap();
+        for i in 0..creators_array.len() {
+            //TODO, set allowed creators in cm initialization
+            if (creators_array[i].address == candy_machine.data.allowed_creator_one || creators_array[i].address == candy_machine.data.allowed_creator_two) && creators_array[i].verified {
+                *has_creator = true;
+            }
+        }
+        if !*has_creator {
+            return Err(ErrorCode::NoVerifiedCreator.into());
+        }
+
+        let token_acc: SplAccount =
+            Pack::unpack_unchecked(&ctx.accounts.buyer_token_mint_account.data.borrow())?;
+
+        //ensure token acc mint = metadata mint
+        if metadata.mint != token_acc.mint {
+            return Err(ErrorCode::MetadataAndTokenAccountMismatch.into());
+        }
+
+        //ensure token acc amount == 1
+        if token_acc.amount != 1 {
+            return Err(ErrorCode::AccountDoesNotHoldNft.into());
+        }
+
+        //ensure mint account owner is signer
+        if token_acc.owner != *ctx.accounts.payer.key {
+            return Err(ErrorCode::SignerIsNotOwnerOfTokenAccount.into());
+        }
+
+        //IF WE GOT SO FAR, THE NFT WAS VALID
+        //NFT AUTH END
 
         let mut remaining_accounts_counter: usize = 0;
         if let Some(gatekeeper) = &candy_machine.data.gatekeeper {
@@ -667,6 +712,28 @@ pub struct MintNFT<'info> {
     recent_blockhashes: UncheckedAccount<'info>,
     #[account(address = sysvar::instructions::id())]
     instruction_sysvar_account: UncheckedAccount<'info>,
+    
+    //NFT MINT
+    //as the account can only be initialized once upon succesful mint, any subsequent mints that try to reinitialize this account will fail.
+    //Probably the simplest way to do NFT whitelist 
+    //Non user provided bump, as there are multiple valid bumps.(would result in a savvy minter maybe mintin 2-3 with the same nft)
+    #[account(
+        init,
+        seeds = [buyer_metadata.key.as_ref()],
+        bump,
+        payer = payer,
+        space=40
+    )]
+    pub nft_buyer: Account<'info, NftBuyer>,
+    #[account(constraint= metadata.owner == &metaplex_token_metadata::id())]
+    //nft metadata
+    pub buyer_metadata: AccountInfo<'info>,
+    //nft token account
+    #[account(constraint= buyer_token_mint_account.owner == &spl_token::id())]
+    pub buyer_token_mint_account: AccountInfo<'info>,
+    //NFT MINT END
+    
+    
     // > Only needed if candy machine has a gatekeeper
     // gateway_token
     // > Only needed if candy machine has a gatekeeper and it has expire_on_use set to true:
@@ -723,7 +790,11 @@ pub enum WhitelistMintMode {
     BurnEveryTime,
     NeverBurn,
 }
-
+#[account]
+#[derive(Default)]
+pub struct NftBuyer {
+    pub metadata_key: Pubkey, //32 bytes
+}
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, Default)]
 pub struct CandyMachineData {
     pub uuid: String,
@@ -743,6 +814,10 @@ pub struct CandyMachineData {
     pub items_available: u64,
     /// If [`Some`] requires gateway tokens on mint
     pub gatekeeper: Option<GatekeeperConfig>,
+
+    //NFT MINT
+    pub allowed_creator_one: Pubkey,
+    pub allowed_creator_two: Pubkey
 }
 
 /// Configurations options for the gatekeeper
@@ -973,6 +1048,16 @@ pub struct Creator {
 
 #[error]
 pub enum ErrorCode {
+    #[msg("Signer is not owner of NFT account!")]
+    SignerIsNotOwnerOfTokenAccount,
+    #[msg("This account does not hold an NFT!")]
+    AccountDoesNotHoldNft,
+    #[msg("Metadata mint address does not match token account mint address!")]
+    MetadataAndTokenAccountMismatch,
+    #[msg("Could not find verified creator!")]
+    NoVerifiedCreator,
+    #[msg("Metadata creators array is empty!")]
+    EmptyCreatorsArray,
     #[msg("Account does not have correct owner!")]
     IncorrectOwner,
     #[msg("Account is not initialized!")]
